@@ -3,15 +3,29 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync"
 
 	"bittorrent-client/internal/bencode"
+	"bittorrent-client/internal/download"
 	"bittorrent-client/internal/peer"
+	"bittorrent-client/internal/storage"
 	"bittorrent-client/internal/torrent"
 	"bittorrent-client/internal/tracker"
 )
 
+var once sync.Once
+
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("usage: go run . <torrent-file>")
+		os.Exit(1)
+	}
+
 	path := os.Args[1]
+
+	// ======================================================
+	// Read torrent file
+	// ======================================================
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -30,10 +44,35 @@ func main() {
 		panic(err)
 	}
 
+	fmt.Printf("Loaded torrent: %s\n", meta.Name)
+	fmt.Printf("Total size: %d bytes\n", meta.Length)
+	fmt.Printf("Pieces: %d\n", len(meta.Pieces))
+
+	// ======================================================
+	// Create piece manager
+	// ======================================================
+
+	store, err := storage.NewStorage(meta)
+if err != nil {
+	panic(err)
+}
+
+	manager := download.NewPieceManager(meta, store)
+
+	// ======================================================
+	// Generate peer ID
+	// ======================================================
+
 	peerID, err := peer.GeneratePeerID()
 	if err != nil {
 		panic(err)
 	}
+
+	fmt.Printf("Peer ID: %s\n", string(peerID[:]))
+
+	// ======================================================
+	// Announce to tracker
+	// ======================================================
 
 	response, err := tracker.Announce(meta, peerID, 6881)
 	if err != nil {
@@ -43,110 +82,41 @@ func main() {
 	fmt.Printf("Tracker interval: %d\n", response.Interval)
 	fmt.Printf("Peers found: %d\n", len(response.Peers))
 
-	var client *peer.Client
+	// ======================================================
+	// Concurrency coordination
+	// ======================================================
 
-	for _, p := range response.Peers {
-		fmt.Printf("Trying peer %s:%d\n", p.IP.String(), p.Port)
+	done := make(chan struct{})
 
-		c, err := peer.Connect(
+	var once sync.Once
+
+	// ======================================================
+	// Worker pool
+	// ======================================================
+
+	maxWorkers := 30
+
+	for i, p := range response.Peers {
+
+		if i >= maxWorkers {
+			break
+		}
+
+		go download.StartWorker(
 			p,
-			meta.InfoHash,
+			meta,
+			manager,
 			peerID,
+			done,
+			&once,
 		)
-
-		if err != nil {
-			fmt.Printf("Connection failed: %v\n", err)
-			continue
-		}
-
-		client = c
-
-		fmt.Printf("Connected to peer %s:%d\n", p.IP.String(), p.Port)
-		break
 	}
 
-	if client == nil {
-		panic("failed to connect to any peer")
-	}
+	// ======================================================
+	// Wait for completion
+	// ======================================================
 
-	defer client.Close()
+	<-done
 
-	messages := make(chan *peer.Message)
-	errors := make(chan error)
-
-	client.ReadLoop(messages, errors)
-
-	// send interested immediately after connect/bitfield
-	// (we don't strictly wait for bitfield for simplicity)
-	_, _ = client.Conn.Write(peer.NewInterested().Serialize())
-
-	var (
-
-		pieceIndex   = 0
-		received     []byte
-		blockSize    = 16 * 1024
-		expectedSize = meta.PieceLength
-	)
-
-	fmt.Println("Starting download loop...")
-
-	for {
-		select {
-
-		case err := <-errors:
-			panic(err)
-
-		case msg := <-messages:
-
-			if msg.ID == nil {
-				continue
-			}
-
-			switch *msg.ID {
-
-			case peer.MsgBitfield:
-				fmt.Println("Received bitfield")
-
-				// explicitly express interest
-				_, _ = client.Conn.Write(peer.NewInterested().Serialize())
-
-			case peer.MsgUnchoke:
-				fmt.Println("Unchoked by peer")
-
-				// first request
-				req := peer.NewRequest(pieceIndex, 0, blockSize)
-				_, _ = client.Conn.Write(req.Serialize())
-
-			case peer.MsgPiece:
-				index, begin, block, err := peer.ParsePiece(msg.Payload)
-				if err != nil {
-					fmt.Println("bad piece:", err)
-					continue
-				}
-
-				if index != pieceIndex {
-					continue
-				}
-
-				fmt.Printf("Got block offset=%d size=%d\n", begin, len(block))
-
-				received = append(received, block...)
-
-				// request next block
-				if len(received) < expectedSize {
-					nextBegin := len(received)
-
-					req := peer.NewRequest(pieceIndex, nextBegin, blockSize)
-					_, _ = client.Conn.Write(req.Serialize())
-				} else {
-					fmt.Println("Piece download complete (NOT verified yet)")
-					fmt.Printf("Total bytes: %d\n", len(received))
-					return
-				}
-
-			default:
-				// TO-DO
-			}
-		}
-	}
+	fmt.Println("All pieces downloaded")
 }
