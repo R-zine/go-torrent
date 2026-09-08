@@ -1,0 +1,63 @@
+#!/usr/bin/env sh
+
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+step() {
+	printf '\n==> %s\n' "$1"
+}
+
+step "Checking staged whitespace"
+git diff --cached --check
+
+step "Checking Go formatting"
+unformatted="$(gofmt -l .)"
+if [ -n "$unformatted" ]; then
+	printf '%s\n' "The following files are not gofmt-formatted:" "$unformatted" >&2
+	printf '%s\n' "Run: gofmt -w ." >&2
+	exit 1
+fi
+
+step "Checking module metadata"
+go mod tidy -diff
+go mod verify
+
+step "Running go vet"
+go vet ./...
+
+if command -v staticcheck >/dev/null 2>&1; then
+	step "Running staticcheck"
+	staticcheck ./...
+else
+	printf '\n--> staticcheck is not installed; skipping optional check\n'
+fi
+
+if command -v shellcheck >/dev/null 2>&1; then
+	step "Linting the pre-commit hook"
+	shellcheck .githooks/pre-commit
+else
+	printf '\n--> shellcheck is not installed; skipping optional hook lint\n'
+fi
+
+step "Running tests"
+go test -shuffle=on -count=1 ./...
+
+cgo_enabled="$(go env CGO_ENABLED)"
+cc_command="$(go env CC)"
+if [ "$cgo_enabled" = "1" ] && command -v "$cc_command" >/dev/null 2>&1; then
+	step "Running tests with the race detector"
+	go test -race -shuffle=on -count=1 ./...
+else
+	printf '\n--> CGO or a C compiler is unavailable; skipping race tests\n'
+fi
+
+if command -v govulncheck >/dev/null 2>&1; then
+	step "Running govulncheck"
+	govulncheck ./...
+else
+	printf '\n--> govulncheck is not installed; skipping optional vulnerability scan\n'
+fi
+
+printf '\nAll pre-commit checks passed.\n'

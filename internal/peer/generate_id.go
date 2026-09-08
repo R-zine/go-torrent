@@ -3,6 +3,7 @@ package peer
 import (
 	"crypto/rand"
 	"fmt"
+	"math/big"
 )
 
 const (
@@ -40,19 +41,19 @@ func GeneratePeerID() ([20]byte, error) {
 }
 
 func generateRandomString(length int) (string, error) {
+	if length < 0 {
+		return "", fmt.Errorf("random string length must not be negative")
+	}
 	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
 
-	bytes := make([]byte, length)
-
-	randomBytes := make([]byte, length)
-	_, err := rand.Read(randomBytes)
-	if err != nil {
-		return "", err
+	result := make([]byte, length)
+	upperBound := big.NewInt(int64(len(charset)))
+	for i := range result {
+		index, err := rand.Int(rand.Reader, upperBound)
+		if err != nil {
+			return "", err
+		}
+		result[i] = charset[index.Int64()]
 	}
-
-	for i := range bytes {
-		bytes[i] = charset[int(randomBytes[i])%len(charset)]
-	}
-
-	return string(bytes), nil
+	return string(result), nil
 }

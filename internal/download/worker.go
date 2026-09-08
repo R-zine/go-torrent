@@ -1,350 +1,269 @@
 package download
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"sync"
+	"io"
+	"time"
 
 	"bittorrent-client/internal/peer"
 	"bittorrent-client/internal/torrent"
 	"bittorrent-client/internal/tracker"
 )
 
-const BlockSize = 16 * 1024
+const (
+	BlockSize           = 16 * 1024
+	DefaultBlockTimeout = 30 * time.Second
+)
+
+type WorkerOptions struct {
+	ClientConfig peer.ClientConfig
+	BlockTimeout time.Duration
+	OnProgress   func(completed, total int)
+}
 
 func StartWorker(
-	peerAddr tracker.PeerAddress,
+	ctx context.Context,
+	peerAddress tracker.PeerAddress,
 	meta *torrent.TorrentMeta,
 	manager *PieceManager,
 	peerID [20]byte,
-	done chan struct{},
-	once *sync.Once,
-) {
-
-	client, err := peer.Connect(
-		peerAddr,
-		meta.InfoHash,
-		peerID,
-	)
+	options WorkerOptions,
+) error {
+	client, err := peer.ConnectContext(ctx, peerAddress, meta.InfoHash, peerID, options.ClientConfig)
 	if err != nil {
-		fmt.Printf(
-			"[worker %s:%d] connect failed: %v\n",
-			peerAddr.IP.String(),
-			peerAddr.Port,
-			err,
-		)
-		return
+		return fmt.Errorf("connect to %s: %w", peerAddress, err)
 	}
+	return RunClient(ctx, client, meta, manager, options)
+}
 
-	defer client.Close()
-
-	fmt.Printf(
-		"[worker %s:%d] connected\n",
-		peerAddr.IP.String(),
-		peerAddr.Port,
-	)
-
-	messages := make(chan *peer.Message)
-	errors := make(chan error)
-
-	client.ReadLoop(messages, errors)
-
-	// Express interest in peer pieces
-	_, err = client.Conn.Write(
-		peer.NewInterested().Serialize(),
-	)
-	if err != nil {
-		fmt.Printf(
-			"[worker %s:%d] failed sending interested: %v\n",
-			peerAddr.IP.String(),
-			peerAddr.Port,
-			err,
-		)
-		return
+// RunClient runs the download state machine over an already-handshaken client.
+// It is separated from StartWorker to permit deterministic protocol tests.
+func RunClient(
+	ctx context.Context,
+	client *peer.Client,
+	meta *torrent.TorrentMeta,
+	manager *PieceManager,
+	options WorkerOptions,
+) error {
+	if client == nil || meta == nil || manager == nil {
+		return errors.New("worker received a nil dependency")
+	}
+	workerContext, cancel := context.WithCancel(ctx)
+	defer func() {
+		cancel()
+		_ = client.Close()
+	}()
+	messages, readErrors := client.ReadLoop(workerContext)
+	if options.BlockTimeout <= 0 {
+		options.BlockTimeout = DefaultBlockTimeout
+	}
+	if err := client.WriteMessage(peer.NewInterested()); err != nil {
+		return fmt.Errorf("send interested: %w", err)
 	}
 
 	var (
-		unchoked bool
-
-		currentPiece *Piece
-		received     []byte
-
-		peerBitfield *peer.Bitfield
+		unchoked       bool
+		currentPiece   *Piece
+		received       []byte
+		expectedBegin  int
+		expectedLength int
+		peerBitfield   = peer.NewBitfield(len(meta.Pieces))
 	)
-
-	requestNextPiece := func() bool {
-
-		// Cannot request pieces until we know what peer owns
-		if peerBitfield == nil {
-			return false
+	blockTimer := time.NewTimer(time.Hour)
+	if !blockTimer.Stop() {
+		<-blockTimer.C
+	}
+	defer blockTimer.Stop()
+	var blockDeadline <-chan time.Time
+	stopBlockTimer := func() {
+		if blockDeadline == nil {
+			return
 		}
-
-		currentPiece = manager.NextPieceForPeer(
-			peerBitfield.Pieces,
-		)
-
-		if currentPiece == nil {
-			return false
+		if !blockTimer.Stop() {
+			select {
+			case <-blockTimer.C:
+			default:
+			}
 		}
-
-		received = nil
-
-		requestLength := BlockSize
-
-		if currentPiece.Length < requestLength {
-			requestLength = currentPiece.Length
-		}
-
-		req := peer.NewRequest(
-			currentPiece.Index,
-			0,
-			requestLength,
-		)
-
-		_, err := client.Conn.Write(req.Serialize())
-		if err != nil {
-
-			fmt.Printf(
-				"[worker %s:%d] failed requesting piece %d: %v\n",
-				peerAddr.IP.String(),
-				peerAddr.Port,
-				currentPiece.Index,
-				err,
-			)
-
+		blockDeadline = nil
+	}
+	resetBlockTimer := func() {
+		stopBlockTimer()
+		blockTimer.Reset(options.BlockTimeout)
+		blockDeadline = blockTimer.C
+	}
+	releaseCurrent := func() {
+		if currentPiece != nil {
 			manager.MarkFailed(currentPiece.Index)
-
-			currentPiece = nil
-
-			return false
 		}
+		currentPiece = nil
+		received = nil
+		expectedBegin = 0
+		expectedLength = 0
+		stopBlockTimer()
+	}
+	defer releaseCurrent()
 
-		fmt.Printf(
-			"[worker %s:%d] downloading piece %d\n",
-			peerAddr.IP.String(),
-			peerAddr.Port,
-			currentPiece.Index,
-		)
-
-		return true
+	requestBlock := func() error {
+		if currentPiece == nil {
+			return errors.New("cannot request a block without a piece")
+		}
+		expectedBegin = len(received)
+		remaining := currentPiece.Length - expectedBegin
+		if remaining <= 0 {
+			return errors.New("piece has no remaining data")
+		}
+		expectedLength = minInt(BlockSize, remaining)
+		if err := client.WriteMessage(peer.NewRequest(currentPiece.Index, expectedBegin, expectedLength)); err != nil {
+			return fmt.Errorf("request piece %d block %d: %w", currentPiece.Index, expectedBegin, err)
+		}
+		resetBlockTimer()
+		return nil
+	}
+	requestNextPiece := func() error {
+		if !unchoked || currentPiece != nil {
+			return nil
+		}
+		currentPiece = manager.NextPieceForPeer(peerBitfield.Pieces)
+		if currentPiece == nil {
+			return nil
+		}
+		received = make([]byte, 0, currentPiece.Length)
+		if err := requestBlock(); err != nil {
+			releaseCurrent()
+			return err
+		}
+		return nil
 	}
 
-	for {
-
+	for messages != nil || readErrors != nil {
+		updates := manager.Updates()
 		select {
-
-		case <-done:
-			return
-
-		case err := <-errors:
-
-			if currentPiece != nil {
-				manager.MarkFailed(currentPiece.Index)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-blockDeadline:
+			pieceIndex := currentPiece.Index
+			releaseCurrent()
+			return fmt.Errorf("timed out waiting for piece %d block", pieceIndex)
+		case <-updates:
+			if manager.IsComplete() {
+				return nil
 			}
-
-			fmt.Printf(
-				"[worker %s:%d] error: %v\n",
-				peerAddr.IP.String(),
-				peerAddr.Port,
-				err,
-			)
-
-			return
-
-		case msg := <-messages:
-
-			if msg.ID == nil {
-				// keep-alive
+			if err := requestNextPiece(); err != nil {
+				return err
+			}
+		case err, ok := <-readErrors:
+			if !ok {
+				readErrors = nil
+				continue
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("read peer message: %w", err)
+		case message, ok := <-messages:
+			if !ok {
+				messages = nil
+				continue
+			}
+			if message.ID == nil {
 				continue
 			}
 
-			switch *msg.ID {
-
+			switch *message.ID {
 			case peer.MsgBitfield:
+				parsed, err := peer.ParseBitfield(message.Payload, len(meta.Pieces))
+				if err != nil {
+					return fmt.Errorf("invalid bitfield: %w", err)
+				}
+				peerBitfield = parsed
+				if err := requestNextPiece(); err != nil {
+					return err
+				}
 
-				peerBitfield = peer.ParseBitfield(
-					msg.Payload,
-					len(meta.Pieces),
-				)
-
-				fmt.Printf(
-					"[worker %s:%d] received bitfield\n",
-					peerAddr.IP.String(),
-					peerAddr.Port,
-				)
-
-				// If already unchoked, immediately request work
-				if unchoked && currentPiece == nil {
-					requestNextPiece()
+			case peer.MsgHave:
+				index, err := peer.ParseHave(message.Payload)
+				if err != nil {
+					return err
+				}
+				if err := peerBitfield.SetPiece(index); err != nil {
+					return err
+				}
+				if err := requestNextPiece(); err != nil {
+					return err
 				}
 
 			case peer.MsgChoke:
-
-				fmt.Printf(
-					"[worker %s:%d] peer choked us\n",
-					peerAddr.IP.String(),
-					peerAddr.Port,
-				)
-
 				unchoked = false
+				// A choke invalidates outstanding requests. Release the piece so
+				// another peer can make progress.
+				releaseCurrent()
 
 			case peer.MsgUnchoke:
-
-				fmt.Printf(
-					"[worker %s:%d] peer unchoked us\n",
-					peerAddr.IP.String(),
-					peerAddr.Port,
-				)
-
 				unchoked = true
-
-				if currentPiece == nil {
-					requestNextPiece()
+				if err := requestNextPiece(); err != nil {
+					return err
 				}
 
 			case peer.MsgPiece:
-
-				index, begin, block, err := peer.ParsePiece(msg.Payload)
+				index, begin, block, err := peer.ParsePiece(message.Payload)
 				if err != nil {
-					fmt.Printf(
-						"[worker %s:%d] invalid piece payload: %v\n",
-						peerAddr.IP.String(),
-						peerAddr.Port,
-						err,
+					return err
+				}
+				if currentPiece == nil || index != currentPiece.Index {
+					continue // A late response for a cancelled request.
+				}
+				if begin != expectedBegin || len(block) != expectedLength || len(received)+len(block) > currentPiece.Length {
+					releaseCurrent()
+					return fmt.Errorf(
+						"unexpected block for piece %d: offset=%d length=%d, expected offset=%d length=%d",
+						index, begin, len(block), expectedBegin, expectedLength,
 					)
-					continue
 				}
-
-				if currentPiece == nil {
-					continue
-				}
-
-				if index != currentPiece.Index {
-					continue
-				}
-
-				fmt.Printf(
-					"[worker %s:%d] received block piece=%d offset=%d size=%d\n",
-					peerAddr.IP.String(),
-					peerAddr.Port,
-					index,
-					begin,
-					len(block),
-				)
-
-				// NOTE:
-				// This still assumes in-order block delivery.
+				stopBlockTimer()
 				received = append(received, block...)
-
-				// ==================================================
-				// Piece incomplete -> request next block
-				// ==================================================
-
 				if len(received) < currentPiece.Length {
-
-					nextBegin := len(received)
-
-					remaining := currentPiece.Length - nextBegin
-
-					requestLength := BlockSize
-
-					if remaining < requestLength {
-						requestLength = remaining
+					if err := requestBlock(); err != nil {
+						releaseCurrent()
+						return err
 					}
-
-					req := peer.NewRequest(
-						currentPiece.Index,
-						nextBegin,
-						requestLength,
-					)
-
-					_, err := client.Conn.Write(req.Serialize())
-					if err != nil {
-
-						fmt.Printf(
-							"[worker %s:%d] failed requesting next block: %v\n",
-							peerAddr.IP.String(),
-							peerAddr.Port,
-							err,
-						)
-
-						manager.MarkFailed(currentPiece.Index)
-
-						currentPiece = nil
-
-						continue
-					}
-
-				} else {
-
-					// ==================================================
-					// Piece complete
-					// ==================================================
-
-					fmt.Printf(
-						"[worker %s:%d] verifying piece %d\n",
-						peerAddr.IP.String(),
-						peerAddr.Port,
-						currentPiece.Index,
-					)
-
-					err := manager.CompletePiece(
-						currentPiece.Index,
-						received,
-					)
-
-					if err == nil {
-
-						completed, total := manager.Progress()
-
-						fmt.Printf(
-							"Progress: %d/%d\n",
-							completed,
-							total,
-						)
-
-					} else {
-
-						fmt.Printf(
-							"[worker %s:%d] piece %d failed verification: %v\n",
-							peerAddr.IP.String(),
-							peerAddr.Port,
-							currentPiece.Index,
-							err,
-						)
-
-						manager.MarkFailed(currentPiece.Index)
-					}
-
-					currentPiece = nil
-					received = nil
-
-					// ==================================================
-					// Torrent complete
-					// ==================================================
-
-					if manager.IsComplete() {
-
-						fmt.Println("Download complete!")
-
-						once.Do(func() {
-							close(done)
-						})
-
-						return
-					}
-
-					// ==================================================
-					// Continue downloading
-					// ==================================================
-
-					if unchoked {
-						requestNextPiece()
-					}
+					continue
 				}
 
-			default:
-				// Ignore all other messages for now
+				pieceIndex := currentPiece.Index
+				data := received
+				currentPiece = nil
+				received = nil
+				if err := manager.CompletePiece(pieceIndex, data); err != nil {
+					return fmt.Errorf("complete piece %d: %w", pieceIndex, err)
+				}
+				completed, total := manager.Progress()
+				if options.OnProgress != nil {
+					options.OnProgress(completed, total)
+				}
+				if manager.IsComplete() {
+					return nil
+				}
+				if err := requestNextPiece(); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	if manager.IsComplete() {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return io.EOF
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

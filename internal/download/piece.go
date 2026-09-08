@@ -5,15 +5,18 @@ type PieceState int
 const (
 	PieceMissing PieceState = iota
 	PieceDownloading
+	PieceVerifying
 	PieceComplete
 )
 
+// Piece describes an immutable unit of work returned by PieceManager.
 type Piece struct {
 	Index  int
 	Hash   []byte
 	Length int
+}
 
-	State PieceState
-
-	Data []byte
+type managedPiece struct {
+	Piece
+	state PieceState
 }
